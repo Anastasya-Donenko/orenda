@@ -1,3 +1,8 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Оренда від власників</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -108,8 +113,19 @@ details.history summary { cursor: pointer; color: var(--accent); font-size: 0.88
 .foot { color: var(--muted); font-size: 0.82rem; max-width: 65ch; }
 .owner-note { font-size: 0.82rem; color: var(--muted); }
 @media (prefers-reduced-motion: no-preference) { .card { transition: border-color .15s; } }
+[hidden] { display: none !important; }
+body { margin: 0; }
+img { max-width: 100%; }
+:root { padding-top: env(safe-area-inset-top, 0px); padding-bottom: env(safe-area-inset-bottom, 0px); }
+.login { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px 16px; display: grid; gap: 10px; max-width: 560px; }
+.login p { margin: 0; color: var(--muted); font-size: 0.88rem; }
+.login .frow input { width: 100%; }
+.btn { border: 1px solid var(--ink); background: var(--ink); color: var(--bg); border-radius: 999px; padding: 8px 16px; font: 500 0.9rem var(--font-body); cursor: pointer; }
+.btn.ghost { background: transparent; color: var(--ink); border-color: var(--line); }
+.foot-row { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: center; }
 </style>
-
+</head>
+<body>
 <div class="wrap">
   <header>
     <h1>Оренда від власників</h1>
@@ -136,6 +152,19 @@ details.history summary { cursor: pointer; color: var(--accent); font-size: 0.88
   <p class="owner-note" id="ownerNote" hidden></p>
   <main id="list" class="grid-wrap"></main>
 
+  <section class="login" id="loginBox" hidden>
+    <strong>Вхід для статусів</strong>
+    <p>Вставте ключ GitHub для статусів (його ви створили за інструкцією). Ключ зберігається лише в цьому браузері й нікуди, крім GitHub, не надсилається.</p>
+    <div class="frow"><input id="tokenInput" type="password" autocomplete="off" placeholder="github_pat_…" aria-label="Ключ GitHub"></div>
+    <div class="foot-row"><button class="btn" id="tokenSave" type="button">Увійти</button><button class="btn ghost" id="tokenCancel" type="button">Скасувати</button></div>
+    <p id="loginMsg" hidden></p>
+  </section>
+
+  <div class="foot-row">
+    <button class="btn ghost" id="loginBtn" type="button">Мої статуси: увійти</button>
+    <button class="btn ghost" id="logoutBtn" type="button" hidden>Вийти зі статусів</button>
+  </div>
+
   <p class="foot">Агент щоранку о 8:00 перевіряє OLX і DIM.RIA й показує лише оголошення від власників, опубліковані за останню добу. Імен і телефонів тут немає: щоб зв'язатися, відкрийте оригінал оголошення.</p>
 </div>
 
@@ -159,7 +188,9 @@ details.history summary { cursor: pointer; color: var(--accent); font-size: 0.88
   let data = null;
   let statuses = {};
   let isOwner = false;
-  let db = null;
+  const GH = "https://api.github.com/repos/Anastasya-Donenko/orenda-statuses/contents/statuses.json";
+  let token = null;
+  let statusSha = null;
   let tab = "obolon";
 
   const $ = (id) => document.getElementById(id);
@@ -325,7 +356,7 @@ details.history summary { cursor: pointer; color: var(--accent); font-size: 0.88
     }
     body.append(price, meta, links);
 
-    if (isOwner && db) {
+    if (isOwner) {
       const st = document.createElement("div");
       st.className = "status";
       for (const o of STATUSES) {
@@ -388,46 +419,68 @@ details.history summary { cursor: pointer; color: var(--accent); font-size: 0.88
     }
   }
 
+  const b64decode = (b) => new TextDecoder().decode(Uint8Array.from(atob(b.replace(/\n/g, "")), (c) => c.charCodeAt(0)));
+  const b64encode = (t) => { const bytes = new TextEncoder().encode(t); let bin = ""; for (const x of bytes) bin += String.fromCharCode(x); return btoa(bin); };
+  const ghHeaders = () => ({ Authorization: "Bearer " + token, Accept: "application/vnd.github+json" });
+
+  async function fetchStatuses() {
+    const r = await fetch(GH + "?t=" + Date.now(), { headers: ghHeaders(), cache: "no-store" });
+    if (r.status === 401 || r.status === 403 || r.status === 404) throw new Error("auth");
+    if (!r.ok) throw new Error("net");
+    const j = await r.json();
+    statusSha = j.sha;
+    const obj = JSON.parse(b64decode(j.content || "e30=") || "{}");
+    const next = {};
+    for (const [k, v] of Object.entries(obj)) if (v && v.s) next[k] = v.s;
+    statuses = next;
+    return obj;
+  }
+
+  function note(text) { const n = $("ownerNote"); n.hidden = !text; n.textContent = text || ""; }
+
   async function setStatus(id, s) {
     const prev = statuses[id];
     if (s) statuses[id] = s; else delete statuses[id];
     renderTabs(); renderList();
-    try {
-      const ref = db.doc("statuses/" + id);
-      if (s) await ref.set({ s, t: Date.now() }); else await ref.delete();
-    } catch (e) {
-      if (prev) statuses[id] = prev; else delete statuses[id];
-      renderTabs(); renderList();
-      const n = $("ownerNote");
-      n.hidden = false;
-      n.textContent = "Статус не збережено. Перевірте інтернет і спробуйте ще раз.";
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const obj = await fetchStatuses();
+        if (s) obj[id] = { s, t: Date.now() }; else delete obj[id];
+        const r = await fetch(GH, { method: "PUT", headers: ghHeaders(), body: JSON.stringify({
+          message: "Статус: " + id + " → " + (s || "знято"), content: b64encode(JSON.stringify(obj, null, 1) + "\n"), sha: statusSha }) });
+        if (r.status === 409 || r.status === 422) continue;
+        if (!r.ok) throw new Error("put");
+        statusSha = (await r.json()).content.sha;
+        statuses = {}; for (const [k, v] of Object.entries(obj)) if (v && v.s) statuses[k] = v.s;
+        renderTabs(); renderList();
+        note("Статуси збережено на GitHub. Їх бачите тільки ви.");
+        return;
+      } catch (e) { break; }
     }
+    if (prev) statuses[id] = prev; else delete statuses[id];
+    renderTabs(); renderList();
+    note("Статус не збережено. Перевірте інтернет або ключ і спробуйте ще раз.");
   }
 
   async function initOwner() {
-    if (!window.claude || !window.claude.use) return;
+    token = store.get("gh_token");
+    $("loginBtn").hidden = !!token;
+    $("logoutBtn").hidden = !token;
+    if (!token) { isOwner = false; return; }
     try {
-      const user = await window.claude.use("user");
-      isOwner = user ? await user.isOwner() : false;
-      if (!isOwner) return;
-      db = await window.claude.use("db");
-      if (!db) return;
-      const n = $("ownerNote");
-      n.hidden = false;
-      n.textContent = "Статуси бачите тільки ви. Інші відвідувачі бачать лише оголошення.";
-      db.collection("statuses").onSnapshot((snap) => {
-        const next = {};
-        for (const d of snap.docs) { const v = d.data(); if (v && v.s) next[d.id] = v.s; }
-        statuses = next;
-        renderTabs(); renderList();
-      }, () => {});
-      renderList();
-    } catch (e) { /* без статусів сторінка працює як звичайна */ }
+      await fetchStatuses();
+      isOwner = true;
+      note("Статуси бачите тільки ви. Інші відвідувачі бачать лише оголошення.");
+    } catch (e) {
+      isOwner = false;
+      note(e.message === "auth" ? "Ключ не підходить або застарів. Натисніть «Вийти зі статусів» і увійдіть з новим ключем." : "Статуси зараз не завантажились. Перевірте інтернет.");
+    }
+    renderTabs(); renderList();
   }
 
   async function load() {
     try {
-      const r = await fetch("data.json", { cache: "no-store" });
+      const r = await fetch("data.json?t=" + Date.now(), { cache: "no-store" });
       if (r.ok) data = await r.json();
     } catch (e) { data = null; }
     if (data && !Array.isArray(data.listings)) data = null;
@@ -445,7 +498,29 @@ details.history summary { cursor: pointer; color: var(--accent); font-size: 0.88
     for (const id of ["pmin", "pmax", "amin", "amax"]) { $(id).value = ""; store.set("f_" + id, ""); }
     renderList();
   });
+  $("loginBtn").addEventListener("click", () => { $("loginBox").hidden = false; $("tokenInput").focus(); });
+  $("tokenCancel").addEventListener("click", () => { $("loginBox").hidden = true; });
+  $("tokenSave").addEventListener("click", async () => {
+    const v = ($("tokenInput").value || "").trim();
+    if (!v) return;
+    store.set("gh_token", v);
+    $("tokenInput").value = "";
+    await initOwner();
+    const m = $("loginMsg");
+    m.hidden = false;
+    m.textContent = isOwner ? "Готово, статуси увімкнено." : "Не вдалося увійти: перевірте ключ.";
+    if (isOwner) $("loginBox").hidden = true; else { try { localStorage.removeItem("gh_token"); } catch (e) {} $("loginBtn").hidden = false; $("logoutBtn").hidden = true; }
+  });
+  $("logoutBtn").addEventListener("click", () => {
+    try { localStorage.removeItem("gh_token"); } catch (e) {}
+    token = null; isOwner = false; statuses = {}; note("");
+    $("loginBtn").hidden = false; $("logoutBtn").hidden = true;
+    renderTabs(); renderList();
+  });
+  document.addEventListener("visibilitychange", () => { if (!document.hidden && isOwner) fetchStatuses().then(() => { renderTabs(); renderList(); }).catch(() => {}); });
   load();
   initOwner();
 })();
 </script>
+</body>
+</html>
